@@ -1,0 +1,426 @@
+---
+title: "Network Analyses proportional at least 50 reads"
+author: "Michael Mann"
+date: "7/23/2020"
+output: html_document
+---
+ 
+Packages and setup
+```{r setup, warning = FALSE, message=FALSE}
+set.seed(1939842563)
+library(bipartite)
+library(lme4)
+library(car)
+library(emmeans)
+#library(gtools) #for combinations
+library(tidyverse)
+library(cowplot)
+
+```
+
+
+
+Custom Functions
+```{r functions, include=FALSE}
+
+plant_hosts <- function(df){
+  length(unique(df$PlantSp))
+}
+
+
+sample_counter <- function(df){
+  length(unique(df$Sample))
+}
+
+otu_count <- function(df){
+  length(unique(df$OTU))
+}
+
+#function to calculate all network stats
+network_all <- function(df){
+  output <- 
+        df %>%
+          select(PlantSp, OTU, Abundance) %>%
+          mutate(Abundance = round(Abundance*100)) %>% #use this to take proportional data and make it out of 10,000 so rounding doesnt lose a lot of information
+          pivot_wider(names_from = OTU, values_from = Abundance, values_fill = 0) %>%
+          column_to_rownames("PlantSp") %>%
+          networklevel(index = c("linkage density", "NODF", "weighted NODF", "H2", "interaction evenness")) %>%
+          as.list() %>%
+          as_tibble() %>%
+          rename_with( ~gsub(" ", "_", .x, fixed = TRUE)) %>%
+          select(linkage_density, NODF, weighted_NODF, H2, interaction_evenness) 
+  
+  return(output)
+}
+
+#function that cleans up dataframe before processing
+network_all_pipeline <- function(df, metadata) {
+       
+  df %>%
+    pivot_longer(cols = contains("Otu"), names_to = "OTU", values_to = "Abundance") %>%
+    filter(Abundance > 0) %>%
+    left_join(metadata, by = "Sample") %>%
+    filter(Sample != "ITS414") %>% #duplicates within the same elevation, plant, and gradient 
+    filter(Sample != "ITS544") %>%
+    select(PlantSp, Gradient, Elevation, OTU, Abundance, Sample) %>%
+    group_by(Gradient, Elevation) %>%
+    nest() %>%
+    ungroup() %>%
+    mutate(num_plant_hosts = map_dbl(data, plant_hosts)) %>% #count number of plant hosts
+    mutate(num_samples = map_dbl(data, sample_counter)) %>% #count number of samples (should match plant hosts)
+    mutate(num_otus = map_dbl(data, otu_count)) %>%
+    group_by(Gradient) %>%
+    add_count(name = "Gradient_Samples") %>%
+    ungroup() %>%
+    filter(num_plant_hosts >= 4) %>% #remove samples with fewer than 4 plant spp.
+    #filter(Gradient_Samples >= 3) %>% #remove gradients with fewer than 2 samples (messes up lmer)
+    mutate(map_dfr(data, network_all)) #calculate network stats
+
+}
+
+```
+
+```{r read in data, message=FALSE, warning=FALSE}
+ITS_metadata <- read_csv("ENV2014PlantsOnlySamples_2020_06_07.csv")
+AMF_metadata <- read_csv("ENVAMF2014AllSamples_2020_06_07.csv")
+
+
+root_table <- read_csv("ITS_roots_prop_at_least50.csv")
+leaf_table <- read_csv("ITS_leaves_prop_at_least50.csv")
+AMF_table <- read_csv("AMF_prop_at_least50.csv")
+
+```
+
+Calculate network stats
+```{r calculate network stats}
+#function that runs all of it.
+root_all <- network_all_pipeline(root_table, ITS_metadata)
+Leaf_all <- network_all_pipeline(df = leaf_table,  metadata = ITS_metadata)
+AMF_all <- network_all_pipeline(df = AMF_table,  metadata = AMF_metadata)
+
+```
+
+Merge network data
+```{r merged data}
+root_clean <- mutate(root_all, Processing = "Root")
+AMF_clean <-  mutate(AMF_all, Processing = "AMF")
+leaf_clean <-  mutate(Leaf_all, Processing = "Leaf")
+
+
+all_types <- 
+  root_clean %>%
+  bind_rows(AMF_clean) %>%
+  bind_rows(leaf_clean) %>%
+  select(-data) %>%
+  mutate(Processing = as.factor(Processing),
+         Gradient = as.factor(Gradient))
+
+```
+
+H2 Specilialization Code
+```{r H2}
+
+all_types %>%
+  ggplot(aes(x = Elevation, y = H2, color = Gradient)) + geom_line(size = 2) + geom_point(aes(size =  num_plant_hosts), color = "black") + facet_grid(~Processing) +  theme_bw() 
+
+
+H2_mod <- lmer(H2 ~ scale(Elevation)*Processing + scale(num_plant_hosts)  + (1|Gradient), data = all_types, REML = F)
+
+
+plot(H2_mod)
+#check the assumption of normality of residuals
+#histogram of residuals
+hist(resid(H2_mod))
+#qq plot should look like a straight line
+qqnorm(resid(H2_mod))
+qqline(resid(H2_mod))
+#shapiro test p-value should be greater than (>0.01) 
+shapiro.test(resid(H2_mod))
+vif(H2_mod)
+
+
+Anova(H2_mod, type = "III")
+
+
+#contrast by sample type
+emmeans(H2_mod, pairwise ~ Processing | Elevation )
+
+emmeans_output <- emtrends(H2_mod, pairwise ~ Processing, var = "Elevation")
+
+emmeans_slope_plot <- 
+as.data.frame(emmeans_output$emtrends) %>%
+  ggplot(aes(x = Processing)) + geom_point(aes(y = Elevation.trend), size = 4) +  geom_errorbar(aes(ymin=lower.CL, ymax= upper.CL), width=.2,position=position_dodge(.9), size = 3) + 
+  theme_bw(base_size = 20)  + xlab("Sample Type") + ylab("Slope Coefficient for H2\`") 
+
+print(emmeans_slope_plot)
+
+
+emmip(ref_grid(H2_mod, cov.reduce = FALSE), Processing ~ scale(Elevation), CIs = TRUE) -> H2_CI
+
+
+H2_model_plot <- 
+  H2_CI$data %>%
+  ggplot(aes(x = Elevation, y = yvar, fill = Processing, color = Processing, linetype = Processing)) + geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = .5) + geom_line(size = 1.3) + ylab("H2\' Specialization") + theme_bw(base_size = 16) + theme(legend.key.size = unit(2,"line"))  + xlab("Elevation (m)" ) + scale_x_continuous(breaks = c(2500, 3000, 3500, 4000), minor_breaks = seq(2500, 4100, by = 100), limits = c(2500, 4100)) + ylim(0, 1.)  + labs(fill = "Tissue", color = "Tissue", linetype = "Tissue") + scale_color_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_fill_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_linetype_manual(values=c("solid", "twodash", "dotted"))
+
+print(H2_model_plot)
+  
+```
+
+
+Linkage Density
+```{r linkage density}
+
+all_types %>%
+  ggplot(aes(x = Elevation, y = linkage_density, color = Gradient)) + geom_line(size = 2) + geom_point(aes(size =  num_plant_hosts), color = "black")  + facet_grid(~Processing) +  theme_bw() 
+
+
+
+linkage_model <- lmer(log(linkage_density) ~ scale(Elevation)*Processing +  Processing*scale(num_plant_hosts)  + (1|Gradient), data = all_types, REML = F)
+
+
+linkage_model_simpler <- lmer(log(linkage_density) ~ scale(Elevation) +Processing  + (1|Gradient), data = all_types, REML = F)
+
+Anova(linkage_model, type = "III")
+Anova(linkage_model_simpler, type = "III")
+
+plot(linkage_model_simpler)
+hist(resid(linkage_model_simpler))
+#qq plot should look like a straight line
+qqnorm(resid(linkage_model_simpler))
+qqline(resid(linkage_model_simpler))
+vif(linkage_model_simpler)
+
+
+#contrast by sample type
+emmeans(linkage_model_simpler, pairwise ~ Processing)
+
+linkage_density_CI <- 
+  emmeans_output_linkage <- emmip(ref_grid(linkage_model_simpler, cov.reduce = FALSE), Processing ~ Elevation, CIs = T) 
+
+
+linkage_model_plot <- 
+  linkage_density_CI$data %>%
+  ggplot(aes(x = Elevation, y = exp(yvar), fill = Processing, color = Processing, linetype = Processing)) + geom_ribbon(aes(ymin = exp(LCL), ymax = exp(UCL)), alpha = .5) + geom_line() + ylab("Linkage Density") +  theme_bw(base_size = 16) + xlab("Elevation (m)" ) + scale_x_continuous(breaks = c(2500, 3000, 3500, 4000), minor_breaks = seq(2500, 4100, by = 100), limits = c(2500, 4100))  +labs(fill = "Sample Type", color = "Sample Type", linetype = "Sample Type") + scale_color_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_fill_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_linetype_manual(values=c("solid", "twodash", "dotted"))
+
+print(linkage_model_plot)
+
+```
+
+
+Weighted NODF
+```{r nestedness}
+
+all_types %>%
+  ggplot(aes(x = Elevation, y = weighted_NODF, color = Gradient)) + geom_line(size = 2) + geom_point(aes(size =  num_plant_hosts), color = "black")  + facet_grid(~Processing) +  theme_bw() 
+
+NODF_model <- lmer(weighted_NODF ~ scale(Elevation)*Processing + scale(num_plant_hosts) +  (1|Gradient), data = all_types, REML = F)
+
+NODF_model_add <- lmer(weighted_NODF ~ scale(Elevation) + Processing + scale(num_plant_hosts) +  (1|Gradient), data = all_types, REML = F)
+
+
+plot(NODF_model)
+hist(resid(NODF_model))
+#qq plot should look like a straight line
+qqnorm(resid(NODF_model))
+qqline(resid(NODF_model))
+vif(NODF_model)
+
+Anova(NODF_model, type = "III")
+Anova(NODF_model_add, type = "III")
+
+emmeans(NODF_model, pairwise ~ Processing | Elevation )
+
+emmtrends_nestedness <- emtrends(NODF_model, pairwise ~ Processing, var = "Elevation")
+emmtrends_nestedness$emtrends
+
+as.data.frame(emmtrends_nestedness$emtrends) %>%
+  ggplot(aes(x = Processing)) + geom_point(aes(y = Elevation.trend), size = 4) +  geom_errorbar(aes(ymin=lower.CL, ymax= upper.CL), width=.2,position=position_dodge(.9), size = 3) + 
+  theme_bw(base_size = 20)  + xlab("Sample Type") + ylab("Slope Coefficient for NODF") 
+
+
+emmip(ref_grid(NODF_model, cov.reduce = FALSE), Processing ~ Elevation, CIs = TRUE) -> nestedness_CI
+
+nestedness_model_plot <- 
+  nestedness_CI$data %>%
+  ggplot(aes(x = Elevation, y = yvar, fill = Processing, color = Processing, linetype = Processing)) + geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = .5) + geom_line(size = 2) + ylab("NODF") + theme_bw(base_size = 16) + xlab("Elevation (m)" ) + scale_x_continuous(breaks = c(2500, 3000, 3500, 4000), minor_breaks = seq(2500, 4100, by = 100), limits = c(2500, 4100))  + labs(fill = "Tissue", color = "Tissue", linetype = "Tissue") + scale_color_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_fill_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_linetype_manual(values=c("solid", "twodash", "dotted"))
+
+print(nestedness_model_plot)
+
+
+emmip(ref_grid(NODF_model_add, cov.reduce = FALSE), Processing ~ Elevation, CIs = TRUE) -> nestedness_CI_add
+
+nestedness_model_plot_add <- 
+  nestedness_CI_add$data %>%
+  ggplot(aes(x = Elevation, y = yvar, fill = Processing, color = Processing, linetype = Processing)) + geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = .5) + geom_line(size = 2) + ylab("NODF") + theme_bw(base_size = 16) + xlab("Elevation (m)" ) + scale_x_continuous(breaks = c(2500, 3000, 3500, 4000), minor_breaks = seq(2500, 4100, by = 100), limits = c(2500, 4100))  + labs(fill = "Tissue", color = "Tissue", linetype = "Tissue") + scale_color_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_fill_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_linetype_manual(values=c("solid", "twodash", "dotted"))
+
+
+print(nestedness_model_plot_add)
+```
+
+
+
+Interaction Evenness
+```{r interaction evenness}
+
+all_types %>%
+  ggplot(aes(x = Elevation, y = interaction_evenness, color = Gradient)) + geom_line(size = 2) + geom_point(aes(size =  num_plant_hosts), color = "black")  + facet_grid(~Processing) +  theme_bw() 
+
+
+
+evennes_model <- lmer((interaction_evenness) ~ scale(Elevation)*Processing + scale(num_plant_hosts) + (1|Gradient), data = all_types, REML = F)
+
+
+evennes_model_add <- lmer((interaction_evenness) ~ scale(Elevation) + Processing +scale(num_plant_hosts) + (1|Gradient), data = all_types, REML = F)
+
+Anova(evennes_model, type = "III")
+Anova(evennes_model_add, type = "III")
+
+plot(evennes_model)
+hist(resid(evennes_model))
+#qq plot should look like a straight line
+qqnorm(resid(evennes_model))
+qqline(resid(evennes_model))
+vif(evennes_model)
+
+
+emmeans(evennes_model, pairwise ~ Processing)
+
+emmtrends_nestedness <- emtrends(evennes_model, pairwise ~ Processing, var = "Elevation")
+
+
+emmip(ref_grid(evennes_model_add, cov.reduce = FALSE), Processing ~ Elevation, CIs = TRUE) -> evenness_CI
+
+
+evenness_model_plot <- 
+  evenness_CI$data %>%
+  ggplot(aes(x = Elevation, y = yvar, fill = Processing, color = Processing, linetype = Processing)) + geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = .5) + geom_line() + ylab("Interaction Evenness") + theme_bw(base_size = 16) + xlab("Elevation (m)" ) + scale_x_continuous(breaks = c(2500, 3000, 3500, 4000), minor_breaks = seq(2500, 4100, by = 100), limits = c(2500, 4100))  +labs(fill = "Sample Type", color = "Sample Type", linetype = "Sample Type") + scale_color_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_fill_manual(values=c("#56B4E9", "#009E73", "#C4961A")) + scale_linetype_manual(values=c("solid", "twodash", "dotted"))
+
+print(evenness_model_plot)
+
+```
+
+
+H2 and NODF (plots with interaction)
+```{r network plots compiled}
+
+legend <- get_legend(
+  # create some space to the left of the legend
+  H2_model_plot + theme(legend.box.margin = margin(0, 0, 0, 18))
+)
+
+
+prow <- plot_grid(
+  H2_model_plot + theme(legend.position="none"),
+  #linkage_model_plot + theme(legend.position="none"),
+  nestedness_model_plot + theme(legend.position="none"),
+ # evenness_model_plot + theme(legend.position="none"),
+  align = 'h',
+  labels = c("A.", "B."),
+  hjust = -1,
+  nrow = 1
+)
+
+
+plot_grid(prow, legend, rel_widths = c(3, 1))
+
+```
+
+
+```{r old functions, eval=FALSE, include=FALSE}
+network_bootstrap <- function(df, plant_threshold){
+
+    num_samples <- 
+      df %>%
+      distinct(Sample) %>%
+          pull() 
+  
+
+  if (length(num_samples) == plant_threshold){
+    
+        output_tibble <- 
+          df %>%
+          select(PlantSp, OTU, Abundance) %>%
+          pivot_wider(names_from = OTU, values_from = Abundance, values_fill = 0) %>%
+          column_to_rownames("PlantSp") %>%
+          networklevel(index = c("linkage density", "weighted nestedness", "H2", "interaction evenness")) %>%
+          as.list() %>%
+          as_tibble() %>%
+          rename_with( ~gsub(" ", "_", .x, fixed = TRUE)) %>%
+          select(linkage_density, weighted_nestedness, H2, interaction_evenness) %>%
+          mutate(extra_stats = NA)
+
+  } else  
+    {
+  
+  #compute all the combinations
+  combos <- combinations(length(num_samples), plant_threshold, num_samples)
+  
+  network_all_iterations <- data.frame("weighted_nestedness" = rep(NA, nrow(combos)), 
+                      "linkage_density" = rep(NA, nrow(combos)), 
+                      "interaction_evenness"= rep(NA, nrow(combos)),
+                      "H2"= rep(NA, nrow(combos)))
+  
+  
+  for (i in 1:nrow(combos)){
+      
+    network_all_iterations[i,] <- 
+          df %>%
+          filter(Sample %in% combos[i,]) %>%
+          select(PlantSp, OTU, Abundance) %>%
+          pivot_wider(names_from = OTU, values_from = Abundance, values_fill = 0) %>%
+          column_to_rownames("PlantSp") %>%
+          networklevel(index = c("linkage density", "weighted nestedness", "H2", "interaction evenness")) %>%
+          as.vector()
+  }  
+  
+  summ <- 
+    network_all_iterations %>%
+    summarise(across(everything(), ~summary(.x[!is.na(.x)]))) %>%
+    mutate(Stat = c("Min",  "Qtr_1",  "Median",    "Mean", "Qtr_3",   "Max")) %>%
+    mutate(across(where(is.table), as.numeric)) %>%
+    select(linkage_density, weighted_nestedness, H2, interaction_evenness, Stat) %>%
+    as_tibble()
+  
+  summ_rest <- 
+    summ %>%
+    filter(Stat != "Median") %>%
+    rename_with(~paste0("Extra_Stats_", .x))
+  
+  output_tibble <- 
+    summ %>%
+    filter(Stat == "Median") %>%
+    select(-Stat) %>%
+    mutate(extra_stats = list(summ_rest))
+  
+    }
+    
+
+
+  return(output_tibble)
+}
+Network_pipeline <- function(OTU_table, metadata, plants_per_network){
+  output <- 
+    OTU_table %>%
+    pivot_longer(cols = contains("Otu"), names_to = "OTU", values_to = "Abundance") %>%
+    filter(Abundance > 0) %>%
+    left_join(metadata, by = "Sample") %>%
+    filter(Sample != "ITS414") %>%
+    select(PlantSp, Gradient, Elevation, OTU, Abundance, Sample) %>%
+    group_by(Gradient, Elevation) %>%
+    nest() %>%
+    ungroup() %>%
+    mutate(num_plant_hosts = map_dbl(data, plant_hosts)) %>%
+    mutate(num_samples = map_dbl(data, sample_counter)) %>%
+    group_by(Gradient) %>%
+    add_count(name = "Gradient_Samples") %>%
+    ungroup() %>%
+    filter(num_plant_hosts >= plants_per_network) %>% 
+    filter(Gradient_Samples >= 3) %>%
+    mutate(map_dfr(data, network_bootstrap, plants_per_network))
+  
+  return(output)
+}
+
+
+
+```
